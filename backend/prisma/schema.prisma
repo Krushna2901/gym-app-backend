@@ -1,0 +1,218 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MembershipType {
+  normal
+  athlete
+  other
+}
+
+enum PaymentStatus {
+  paid
+  partial
+  pending
+}
+
+enum PaymentMethod {
+  cash
+  upi
+  card
+}
+
+enum UserRole {
+  super_admin
+  branch_admin
+  trainer
+}
+
+enum ReminderType {
+  seven_day @map("7day")
+  three_day @map("3day")
+  expiry
+}
+
+enum ReminderStatus {
+  sent
+  failed
+}
+
+enum DayName {
+  Mon
+  Tue
+  Wed
+  Thu
+  Fri
+  Sat
+  Sun
+}
+
+enum PlanLevel {
+  beginner
+  intermediate
+  athlete
+}
+
+// ─── Phase 1 Active Tables ───────────────────────────────
+
+model Branch {
+  id        String   @id @default(uuid())
+  name      String
+  address   String?
+  phone     String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  members Member[]
+  users   User[]
+
+  @@map("branches")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  name         String
+  role         UserRole @default(trainer)
+  branchId     String?  @map("branch_id")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  branch       Branch?       @relation(fields: [branchId], references: [id])
+  workoutPlans WorkoutPlan[]
+
+  @@map("users")
+}
+
+model Member {
+  id              String         @id @default(uuid())
+  fullName        String         @map("full_name")
+  mobile          String         @unique
+  email           String?
+  address         String?
+  membershipType  MembershipType @default(normal) @map("membership_type")
+  startDate       DateTime       @map("start_date")
+  endDate         DateTime       @map("end_date")
+  paymentStatus   PaymentStatus  @default(pending) @map("payment_status")
+  amountPaid      Decimal        @default(0) @map("amount_paid") @db.Decimal(10, 2)
+  remainingAmount Decimal        @default(0) @map("remaining_amount") @db.Decimal(10, 2)
+  workoutPlanId   String?        @map("workout_plan_id")
+  branchId        String?        @map("branch_id")
+  isDeleted       Boolean        @default(false) @map("is_deleted")
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  branch             Branch?             @relation(fields: [branchId], references: [id])
+  workoutPlan        WorkoutPlan?        @relation(fields: [workoutPlanId], references: [id])
+  payments           Payment[]
+  reminderLogs       ReminderLog[]
+  progressLogs       ProgressLog[]
+  workoutCompletions WorkoutCompletion[]
+
+  @@map("members")
+}
+
+model Payment {
+  id             String        @id @default(uuid())
+  memberId       String        @map("member_id")
+  amount         Decimal       @db.Decimal(10, 2)
+  paymentMethod  PaymentMethod @map("payment_method")
+  transactionRef String?       @map("transaction_ref")
+  paidAt         DateTime      @default(now()) @map("paid_at")
+  invoiceUrl     String?       @map("invoice_url")
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  member Member @relation(fields: [memberId], references: [id])
+
+  @@map("payments")
+}
+
+// ─── Future Phase Tables (created now, used later) ───────
+
+model WorkoutPlan {
+  id          String    @id @default(uuid())
+  name        String
+  level       PlanLevel @default(beginner)
+  description String?
+  trainerId   String?   @map("trainer_id")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  trainer     User?        @relation(fields: [trainerId], references: [id])
+  members     Member[]
+  workoutDays WorkoutDay[]
+
+  @@map("workout_plans")
+}
+
+model WorkoutDay {
+  id          String  @id @default(uuid())
+  planId      String  @map("plan_id")
+  dayName     DayName @map("day_name")
+  muscleGroup String  @map("muscle_group")
+  notes       String?
+
+  workoutPlan WorkoutPlan         @relation(fields: [planId], references: [id])
+  exercises   Exercise[]
+  completions WorkoutCompletion[]
+
+  @@map("workout_days")
+}
+
+model Exercise {
+  id           String @id @default(uuid())
+  workoutDayId String @map("workout_day_id")
+  exerciseName String @map("exercise_name")
+  sets         Int
+  reps         String @default("10-12")
+  restSeconds  Int    @default(60) @map("rest_seconds")
+  orderIndex   Int    @default(0) @map("order_index")
+
+  workoutDay WorkoutDay @relation(fields: [workoutDayId], references: [id])
+
+  @@map("exercises")
+}
+
+model WorkoutCompletion {
+  id            String   @id @default(uuid())
+  memberId      String   @map("member_id")
+  workoutDayId  String   @map("workout_day_id")
+  completedDate DateTime @map("completed_date") @db.Date
+  notes         String?
+
+  member     Member     @relation(fields: [memberId], references: [id])
+  workoutDay WorkoutDay @relation(fields: [workoutDayId], references: [id])
+
+  @@map("workout_completions")
+}
+
+model ReminderLog {
+  id           String         @id @default(uuid())
+  memberId     String         @map("member_id")
+  reminderType ReminderType   @map("reminder_type")
+  sentAt       DateTime       @default(now()) @map("sent_at")
+  status       ReminderStatus
+  waMessageId  String?        @map("wa_message_id")
+
+  member Member @relation(fields: [memberId], references: [id])
+
+  @@map("reminder_logs")
+}
+
+model ProgressLog {
+  id         String   @id @default(uuid())
+  memberId   String   @map("member_id")
+  logDate    DateTime @default(now()) @map("log_date") @db.Date
+  weightKg   Decimal? @map("weight_kg") @db.Decimal(5, 2)
+  bodyFatPct Decimal? @map("body_fat_pct") @db.Decimal(4, 2)
+  chestCm    Decimal? @map("chest_cm") @db.Decimal(5, 1)
+  waistCm    Decimal? @map("waist_cm") @db.Decimal(5, 1)
+  notes      String?
+
+  member Member @relation(fields: [memberId], references: [id])
+
+  @@map("progress_logs")
+}
