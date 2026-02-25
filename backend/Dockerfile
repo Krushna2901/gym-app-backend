@@ -14,10 +14,9 @@ RUN npx prisma generate
 # Copy rest of source
 COPY . .
 
-EXPOSE 5000
-
 # start.sh: migrate → seed → serve
-COPY start.sh ./
 RUN chmod +x start.sh
+
+EXPOSE 5000
 
 CMD ["sh", "start.sh"]
