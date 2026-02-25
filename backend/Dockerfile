@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Install dependencies first (layer-cached unless package.json changes)
 COPY package*.json ./
-COPY prisma ./prisma/
+
 RUN npm ci
 
 # Generate Prisma client
