@@ -6,15 +6,15 @@ WORKDIR /app
 # Install dependencies first (layer-cached unless package.json changes)
 COPY package*.json ./
 COPY prisma ./prisma/
-RUN npm ci
+RUN npm install
 
 # Generate Prisma client
 RUN npx prisma generate
 
-# Copy rest of source
+# Copy rest of source (includes start.sh)
 COPY . .
 
-# start.sh: migrate → seed → serve
+# Ensure start.sh is executable
 RUN chmod +x start.sh
 
 EXPOSE 5000
