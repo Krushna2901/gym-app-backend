@@ -1,28 +1,29 @@
 const express = require('express');
-const { PrismaClient } = require('@prisma/client');
 const { body, validationResult } = require('express-validator');
 const authenticate = require('../middleware/authenticate');
 const { sendPaymentReceipt } = require('../utils/whatsapp');
+const prisma = require('../lib/prisma');
 
 const router = express.Router();
-const prisma = new PrismaClient();
 
 router.use(authenticate);
 
-// POST /api/payments - Record a payment
+// ── POST /api/payments — Record a payment ─────────────────────────────────────
 router.post(
   '/',
   [
     body('memberId').isUUID().withMessage('Valid member ID required'),
-    body('amount').isFloat({ gt: 0 }).withMessage('Amount must be positive'),
+    body('amount').isFloat({ gt: 0 }).withMessage('Amount must be a positive number'),
     body('paymentMethod').isIn(['cash', 'upi', 'card']).withMessage('Invalid payment method'),
+    body('transactionRef')
+      .optional({ checkFalsy: true })
+      .trim()
+      .isLength({ max: 200 }).withMessage('Reference must be under 200 characters'),
   ],
   async (req, res, next) => {
     try {
       const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
       const { memberId, amount, paymentMethod, transactionRef } = req.body;
 
@@ -33,34 +34,28 @@ router.post(
 
       // Create payment and update member balance atomically
       const [payment, updatedMember] = await prisma.$transaction(async (tx) => {
-        const payment = await tx.payment.create({
+        const p = await tx.payment.create({
           data: {
             memberId,
-            amount: parseFloat(amount),
+            amount:        parseFloat(amount),
             paymentMethod,
             transactionRef: transactionRef || null,
           },
         });
 
         const newAmountPaid = parseFloat(member.amountPaid) + parseFloat(amount);
-        const newRemaining = Math.max(0, parseFloat(member.remainingAmount) - parseFloat(amount));
+        const newRemaining  = Math.max(0, parseFloat(member.remainingAmount) - parseFloat(amount));
+        const paymentStatus = newRemaining <= 0 ? 'paid' : 'partial';
 
-        let paymentStatus = 'partial';
-        if (newRemaining <= 0) paymentStatus = 'paid';
-
-        const updatedMember = await tx.member.update({
+        const m = await tx.member.update({
           where: { id: memberId },
-          data: {
-            amountPaid: newAmountPaid,
-            remainingAmount: newRemaining,
-            paymentStatus,
-          },
+          data: { amountPaid: newAmountPaid, remainingAmount: newRemaining, paymentStatus },
         });
 
-        return [payment, updatedMember];
+        return [p, m];
       });
 
-      // Fire-and-forget WhatsApp mock notification
+      // Fire-and-forget WhatsApp mock notification (never blocks response)
       sendPaymentReceipt(member.mobile, member.fullName, amount).catch(console.error);
 
       res.status(201).json({ data: payment, member: updatedMember });
@@ -70,24 +65,18 @@ router.post(
   }
 );
 
-// GET /api/payments/summary - Revenue overview
+// ── GET /api/payments/summary — Revenue overview ──────────────────────────────
 // MUST be before /member/:id to avoid route conflict
 router.get('/summary', async (req, res, next) => {
   try {
-    const now = new Date();
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const now              = new Date();
+    const startOfMonth     = new Date(now.getFullYear(), now.getMonth(), 1);
     const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
 
     const [totalRevenue, monthlyRevenue, lastMonthRevenue, recentPayments] = await Promise.all([
       prisma.payment.aggregate({ _sum: { amount: true } }),
-      prisma.payment.aggregate({
-        _sum: { amount: true },
-        where: { paidAt: { gte: startOfMonth } },
-      }),
-      prisma.payment.aggregate({
-        _sum: { amount: true },
-        where: { paidAt: { gte: startOfLastMonth, lt: startOfMonth } },
-      }),
+      prisma.payment.aggregate({ _sum: { amount: true }, where: { paidAt: { gte: startOfMonth } } }),
+      prisma.payment.aggregate({ _sum: { amount: true }, where: { paidAt: { gte: startOfLastMonth, lt: startOfMonth } } }),
       prisma.payment.findMany({
         take: 10,
         orderBy: { paidAt: 'desc' },
@@ -97,8 +86,8 @@ router.get('/summary', async (req, res, next) => {
 
     res.json({
       data: {
-        totalRevenue: totalRevenue._sum.amount || 0,
-        monthlyRevenue: monthlyRevenue._sum.amount || 0,
+        totalRevenue:     totalRevenue._sum.amount     || 0,
+        monthlyRevenue:   monthlyRevenue._sum.amount   || 0,
         lastMonthRevenue: lastMonthRevenue._sum.amount || 0,
         recentPayments,
       },
@@ -108,7 +97,7 @@ router.get('/summary', async (req, res, next) => {
   }
 });
 
-// GET /api/payments/member/:id - Payment history for a member
+// ── GET /api/payments/member/:id — Payment history for a member ───────────────
 router.get('/member/:id', async (req, res, next) => {
   try {
     const payments = await prisma.payment.findMany({

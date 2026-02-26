@@ -1,18 +1,23 @@
 const express = require('express');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const { PrismaClient } = require('@prisma/client');
+const bcrypt  = require('bcryptjs');
+const jwt     = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
+const prisma  = require('../lib/prisma');
 
 const router = express.Router();
-const prisma = new PrismaClient();
 
 // POST /api/auth/admin-login
 router.post(
   '/admin-login',
   [
-    body('email').isEmail().withMessage('Valid email required'),
-    body('password').notEmpty().withMessage('Password required'),
+    body('email')
+      .trim()
+      .notEmpty().withMessage('Email required')
+      .isEmail().withMessage('Valid email required')
+      .normalizeEmail(),
+    body('password')
+      .trim()
+      .notEmpty().withMessage('Password required'),
   ],
   async (req, res, next) => {
     try {
@@ -24,12 +29,15 @@ router.post(
       const { email, password } = req.body;
 
       const user = await prisma.user.findUnique({ where: { email } });
-      if (!user) {
-        return res.status(401).json({ error: 'Invalid email or password' });
-      }
 
-      const validPassword = await bcrypt.compare(password, user.passwordHash);
-      if (!validPassword) {
+      // Always run bcrypt.compare to prevent timing-based user enumeration.
+      // If user doesn't exist, compare against a dummy hash so response time
+      // is identical whether the email exists or not.
+      const DUMMY_HASH = '$2b$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012345';
+      const hashToCompare = user ? user.passwordHash : DUMMY_HASH;
+      const validPassword = await bcrypt.compare(password, hashToCompare);
+
+      if (!user || !validPassword) {
         return res.status(401).json({ error: 'Invalid email or password' });
       }
 

@@ -1,28 +1,32 @@
-const express = require('express');
-const { PrismaClient } = require('@prisma/client');
-const { body, validationResult } = require('express-validator');
+const express   = require('express');
+const { validate, memberValidationRules, createMemberRules, renewValidationRules } = require('../middleware/validators/memberValidator');
 const authenticate = require('../middleware/authenticate');
+const prisma    = require('../lib/prisma');
 
 const router = express.Router();
-const prisma = new PrismaClient();
 
 // All member routes require authentication
 router.use(authenticate);
 
-// GET /api/members/expiring - Members expiring within N days
+// ── Helper ────────────────────────────────────────────────────────────────────
+// Single source of truth for paymentStatus derivation.
+function derivePaymentStatus(paid, remaining) {
+  if (paid > 0 && remaining <= 0) return 'paid';
+  if (paid > 0 && remaining > 0)  return 'partial';
+  return 'pending';
+}
+
+// ── GET /api/members/expiring ─────────────────────────────────────────────────
 // MUST be before /:id to avoid route conflict
 router.get('/expiring', async (req, res, next) => {
   try {
-    const days = parseInt(req.query.days) || 30;
-    const now = new Date();
-    const futureDate = new Date();
-    futureDate.setDate(futureDate.getDate() + days);
+    const days = Math.min(Math.max(1, parseInt(req.query.days) || 30), 90);
+    const now  = new Date();
+    const until = new Date();
+    until.setDate(until.getDate() + days);
 
     const members = await prisma.member.findMany({
-      where: {
-        isDeleted: false,
-        endDate: { gte: now, lte: futureDate },
-      },
+      where: { isDeleted: false, endDate: { gte: now, lte: until } },
       orderBy: { endDate: 'asc' },
     });
 
@@ -32,27 +36,28 @@ router.get('/expiring', async (req, res, next) => {
   }
 });
 
-// GET /api/members - List with search, filter, pagination
+// ── GET /api/members ──────────────────────────────────────────────────────────
 router.get('/', async (req, res, next) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-    const search = req.query.search || '';
+    const page  = Math.max(1, parseInt(req.query.page) || 1);
+    // Cap limit at 5000 — enough for any gym's full export, prevents runaway queries
+    const limit = Math.min(Math.max(1, parseInt(req.query.limit) || 20), 5000);
+    const skip  = (page - 1) * limit;
+    const search = (req.query.search || '').trim();
     const status = req.query.status;
-    const type = req.query.type;
+    const type   = req.query.type;
 
     const where = {
       isDeleted: false,
       ...(search && {
         OR: [
           { fullName: { contains: search, mode: 'insensitive' } },
-          { mobile: { contains: search } },
-          { email: { contains: search, mode: 'insensitive' } },
+          { mobile:   { contains: search } },
+          { email:    { contains: search, mode: 'insensitive' } },
         ],
       }),
       ...(status && { paymentStatus: status }),
-      ...(type && { membershipType: type }),
+      ...(type   && { membershipType: type }),
     };
 
     const [members, total] = await Promise.all([
@@ -68,19 +73,14 @@ router.get('/', async (req, res, next) => {
 
     res.json({
       data: members,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-      },
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
     });
   } catch (err) {
     next(err);
   }
 });
 
-// GET /api/members/:id - Single member with payments
+// ── GET /api/members/:id ──────────────────────────────────────────────────────
 router.get('/:id', async (req, res, next) => {
   try {
     const member = await prisma.member.findFirst({
@@ -95,113 +95,103 @@ router.get('/:id', async (req, res, next) => {
   }
 });
 
-// POST /api/members - Create member
-router.post(
-  '/',
-  [
-    body('fullName').trim().notEmpty().withMessage('Full name is required'),
-    body('mobile').trim().notEmpty().withMessage('Mobile number is required'),
-    body('startDate').isISO8601().withMessage('Valid start date required'),
-    body('endDate').isISO8601().withMessage('Valid end date required'),
-    body('membershipType').optional().isIn(['normal', 'athlete', 'other']),
-    body('initialPaymentMethod').optional().isIn(['cash', 'upi', 'card']),
-  ],
-  async (req, res, next) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
+// ── POST /api/members — Create ────────────────────────────────────────────────
+router.post('/', createMemberRules, validate, async (req, res, next) => {
+  try {
+    const {
+      fullName, mobile, email, address,
+      membershipType, startDate, endDate,
+      amountPaid, remainingAmount, branchId,
+      initialPaymentMethod, transactionRef,
+    } = req.body;
 
-      const {
-        fullName, mobile, email, address,
-        membershipType, startDate, endDate,
-        amountPaid, remainingAmount, branchId,
-        initialPaymentMethod, transactionRef,
-      } = req.body;
+    const paid      = parseFloat(amountPaid)      || 0;
+    const remaining = parseFloat(remainingAmount) || 0;
 
-      let paymentStatus = 'pending';
-      const paid = parseFloat(amountPaid) || 0;
-      const remaining = parseFloat(remainingAmount) || 0;
-      if (paid > 0 && remaining > 0) paymentStatus = 'partial';
-      if (paid > 0 && remaining <= 0) paymentStatus = 'paid';
-
-      // Create member + initial payment atomically so revenue is always accurate
-      const member = await prisma.$transaction(async (tx) => {
-        const member = await tx.member.create({
-          data: {
-            fullName,
-            mobile,
-            email: email || null,
-            address: address || null,
-            membershipType: membershipType || 'normal',
-            startDate: new Date(startDate),
-            endDate: new Date(endDate),
-            paymentStatus,
-            amountPaid: paid,
-            remainingAmount: remaining,
-            branchId: branchId || null,
-          },
-        });
-
-        // Record initial payment so it appears in revenue dashboard
-        if (paid > 0) {
-          await tx.payment.create({
-            data: {
-              memberId: member.id,
-              amount: paid,
-              paymentMethod: initialPaymentMethod || 'cash',
-              transactionRef: transactionRef || null,
-            },
-          });
-        }
-
-        return member;
+    // Create member + initial payment in a single atomic transaction
+    const member = await prisma.$transaction(async (tx) => {
+      const m = await tx.member.create({
+        data: {
+          fullName,
+          mobile,
+          email:          email   || null,
+          address:        address || null,
+          membershipType: membershipType || 'normal',
+          startDate:      new Date(startDate),
+          endDate:        new Date(endDate),
+          paymentStatus:  derivePaymentStatus(paid, remaining),
+          amountPaid:     paid,
+          remainingAmount: remaining,
+          branchId:       branchId || null,
+        },
       });
 
-      res.status(201).json({ data: member });
-    } catch (err) {
-      if (err.code === 'P2002') {
-        return res.status(409).json({ error: 'A member with this mobile number already exists' });
+      if (paid > 0) {
+        await tx.payment.create({
+          data: {
+            memberId:      m.id,
+            amount:        paid,
+            paymentMethod: initialPaymentMethod || 'cash',
+            transactionRef: transactionRef || null,
+          },
+        });
       }
-      next(err);
-    }
-  }
-);
 
-// PUT /api/members/:id - Update member
-router.put('/:id', async (req, res, next) => {
+      return m;
+    });
+
+    res.status(201).json({ data: member });
+  } catch (err) {
+    if (err.code === 'P2002') {
+      return res.status(409).json({ error: 'A member with this mobile number already exists' });
+    }
+    next(err);
+  }
+});
+
+// ── PUT /api/members/:id — Update ────────────────────────────────────────────
+// Only whitelisted fields are applied — prevents overwriting isDeleted,
+// createdAt, or any internal flags via req.body spread.
+router.put('/:id', memberValidationRules, validate, async (req, res, next) => {
   try {
     const existing = await prisma.member.findFirst({
       where: { id: req.params.id, isDeleted: false },
     });
     if (!existing) return res.status(404).json({ error: 'Member not found' });
 
-    const updateData = { ...req.body };
-    if (updateData.startDate) updateData.startDate = new Date(updateData.startDate);
-    if (updateData.endDate) updateData.endDate = new Date(updateData.endDate);
-    if (updateData.amountPaid !== undefined) updateData.amountPaid = parseFloat(updateData.amountPaid);
-    if (updateData.remainingAmount !== undefined) updateData.remainingAmount = parseFloat(updateData.remainingAmount);
+    // Explicitly destructure only the fields we allow updating
+    const { fullName, mobile, email, address, membershipType, startDate, endDate, amountPaid, remainingAmount } = req.body;
 
-    // Remove fields that shouldn't be directly updated
-    delete updateData.id;
-    delete updateData.createdAt;
-    delete updateData.updatedAt;
-    delete updateData.payments;
-    delete updateData.branch;
+    const paid      = amountPaid      !== undefined ? parseFloat(amountPaid)      : parseFloat(existing.amountPaid);
+    const remaining = remainingAmount !== undefined ? parseFloat(remainingAmount) : parseFloat(existing.remainingAmount);
 
     const member = await prisma.member.update({
-      where: { id: req.params.id },
-      data: updateData,
+      where: { id: req.params.id, isDeleted: false },
+      data: {
+        fullName,
+        mobile,
+        email:           email   || null,
+        address:         address || null,
+        membershipType:  membershipType || existing.membershipType,
+        startDate:       startDate ? new Date(startDate) : existing.startDate,
+        endDate:         endDate   ? new Date(endDate)   : existing.endDate,
+        amountPaid:      paid,
+        remainingAmount: remaining,
+        // Always recalculate — client cannot manually set paymentStatus
+        paymentStatus:   derivePaymentStatus(paid, remaining),
+      },
     });
 
     res.json({ data: member });
   } catch (err) {
+    if (err.code === 'P2002') {
+      return res.status(409).json({ error: 'A member with this mobile number already exists' });
+    }
     next(err);
   }
 });
 
-// DELETE /api/members/:id - Soft delete
+// ── DELETE /api/members/:id — Soft delete ────────────────────────────────────
 router.delete('/:id', async (req, res, next) => {
   try {
     const existing = await prisma.member.findFirst({
@@ -210,7 +200,7 @@ router.delete('/:id', async (req, res, next) => {
     if (!existing) return res.status(404).json({ error: 'Member not found' });
 
     await prisma.member.update({
-      where: { id: req.params.id },
+      where: { id: req.params.id, isDeleted: false },
       data: { isDeleted: true },
     });
 
@@ -220,8 +210,8 @@ router.delete('/:id', async (req, res, next) => {
   }
 });
 
-// POST /api/members/:id/renew - Renew membership
-router.post('/:id/renew', async (req, res, next) => {
+// ── POST /api/members/:id/renew ───────────────────────────────────────────────
+router.post('/:id/renew', renewValidationRules, validate, async (req, res, next) => {
   try {
     const { startDate, endDate, amountPaid, remainingAmount, paymentMethod, transactionRef } = req.body;
 
@@ -230,37 +220,33 @@ router.post('/:id/renew', async (req, res, next) => {
     });
     if (!existing) return res.status(404).json({ error: 'Member not found' });
 
-    const paid = parseFloat(amountPaid) || 0;
+    const paid      = parseFloat(amountPaid)      || 0;
     const remaining = parseFloat(remainingAmount) || 0;
-    let paymentStatus = 'pending';
-    if (paid > 0 && remaining > 0) paymentStatus = 'partial';
-    if (paid > 0 && remaining <= 0) paymentStatus = 'paid';
 
     const member = await prisma.$transaction(async (tx) => {
-      const member = await tx.member.update({
+      const m = await tx.member.update({
         where: { id: req.params.id },
         data: {
-          startDate: new Date(startDate),
-          endDate: new Date(endDate),
-          amountPaid: paid,
+          startDate:       new Date(startDate),
+          endDate:         new Date(endDate),
+          amountPaid:      paid,
           remainingAmount: remaining,
-          paymentStatus,
+          paymentStatus:   derivePaymentStatus(paid, remaining),
         },
       });
 
-      // Record renewal payment so it appears in revenue
       if (paid > 0) {
         await tx.payment.create({
           data: {
-            memberId: req.params.id,
-            amount: paid,
+            memberId:      req.params.id,
+            amount:        paid,
             paymentMethod: paymentMethod || 'cash',
             transactionRef: transactionRef || null,
           },
         });
       }
 
-      return member;
+      return m;
     });
 
     res.json({ data: member });
